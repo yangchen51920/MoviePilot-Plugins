@@ -1,4 +1,5 @@
-  "AgentResourceOfficer": {
+}
+"AgentResourceOfficer": {
     "name": "Agent影视助手",
     "description": "龙虾agent稳定控制 MP：飞书入口、盘搜/影巢搜索、115/夸克转存、智能评分推荐。",
     "labels": "Agent,影巢,HDHive,115,夸克,Quark,智能体,转存,解锁",
@@ -200,3 +201,4 @@
       "0.1.0": "首个可用版本，已接入夸克转存、115 转存、影巢搜索/解锁，以及解锁后自动路由到对应网盘执行层。"
     }
   }
+}
