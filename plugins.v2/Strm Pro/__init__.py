@@ -65,7 +65,7 @@ class FileMonitorHandler(FileSystemEventHandler):
         )
 
 
-class Strm Pro(_PluginBase):
+class StrmPro(_PluginBase):
 
     # 插件名称
     plugin_name = "云盘Strm助手Pro"
@@ -80,7 +80,7 @@ class Strm Pro(_PluginBase):
     # 作者主页
     author_url = "https://github.com/yangchen51920"
     # 插件配置项ID前缀
-    plugin_config_prefix = "Strm Pro"
+    plugin_config_prefix = "StrmPro_"
     # 加载顺序
     plugin_order = 27
     # 可使用的用户级别
