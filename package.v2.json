@@ -20,7 +20,7 @@
       "v1.0": "MoviePilot V2 版本站点数据统计插件"
     }
 {
-  "LocalStrm": {
+  "StrmLocal": {
     "name": "本地Strm助手",
     "description": "Strm",
     "labels": "Strm",
