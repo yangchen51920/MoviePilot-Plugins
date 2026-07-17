@@ -19,17 +19,17 @@
       "v1.1": "修复增量数据统计问题",
       "v1.0": "MoviePilot V2 版本站点数据统计插件"
     }
-{
+  },
   "StrmLocal": {
     "name": "本地Strm助手",
-    "description": "Strm",
-    "labels": "Strm",
-    "version": "1.9",
-    "icon": "123Pan_A.png",
+    "description": "监控本地目录文件变化，生成包含本地文件路径的strm文件",
+    "labels": "Strm,本地",
+    "version": "1.0",
+    "icon": "",
     "author": "yangchen51920",
     "level": 2,
     "history": {
-      "v1.0": "123"
+      "v1.0": "初始版本：支持本地目录监控、strm文件生成、关联文件复制、路径替换"
     }
   }
 }
