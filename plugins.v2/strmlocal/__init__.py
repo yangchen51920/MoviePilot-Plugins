@@ -20,37 +20,49 @@ lock = threading.Lock()
 
 class FileMonitorHandler(FileSystemEventHandler):
     """
-    目录监控响应类
+    目录监控响应类（单Observer多目录模式）
     """
 
-    def __init__(self, monpath: str, sync: Any, **kwargs):
+    def __init__(self, sync: Any, **kwargs):
         super(FileMonitorHandler, self).__init__(**kwargs)
-        self._monpath = monpath
         self._sync = sync
 
+    def _find_mon_path(self, event_path: str) -> str:
+        """根据事件路径找到匹配的监控源目录"""
+        for mon_path in self._sync._strm_dir_conf.keys():
+            if event_path.startswith(mon_path):
+                return mon_path
+        return None
+
     def on_created(self, event):
-        self._sync.event_handler(
-            event=event,
-            mon_path=self._monpath,
-            text="创建",
-            event_path=event.src_path,
-        )
+        mon_path = self._find_mon_path(event.src_path)
+        if mon_path:
+            self._sync.event_handler(
+                event=event,
+                mon_path=mon_path,
+                text="创建",
+                event_path=event.src_path,
+            )
 
     def on_moved(self, event):
-        self._sync.event_handler(
-            event=event,
-            mon_path=self._monpath,
-            text="移动",
-            event_path=event.dest_path,
-        )
+        mon_path = self._find_mon_path(event.dest_path)
+        if mon_path:
+            self._sync.event_handler(
+                event=event,
+                mon_path=mon_path,
+                text="移动",
+                event_path=event.dest_path,
+            )
 
     def on_deleted(self, event):
-        self._sync.event_handler(
-            event=event,
-            mon_path=self._monpath,
-            text="删除",
-            event_path=event.src_path,
-        )
+        mon_path = self._find_mon_path(event.src_path)
+        if mon_path:
+            self._sync.event_handler(
+                event=event,
+                mon_path=mon_path,
+                text="删除",
+                event_path=event.src_path,
+            )
 
 
 class StrmLocal(_PluginBase):
@@ -81,7 +93,7 @@ class StrmLocal(_PluginBase):
     _monitor = False
     _onlyonce = False
     _strm_dir_conf = {}
-    _observer = []
+    _observer = None
     _rmt_mediaext = None
     _path_replacements = {}
     _scheduler = None
@@ -157,21 +169,19 @@ class StrmLocal(_PluginBase):
                 self._scheduler.start()
                 logger.info("本地Strm助手定时任务已启动")
 
-                # 启动目录监控
+                # 启动目录监控（单个Observer监控所有目录）
                 if self._monitor:
-                    for mon_path in self._strm_dir_conf.keys():
-                        if Path(mon_path).exists():
-                            observer = PollingObserver(timeout=10)
-                            observer.schedule(
-                                FileMonitorHandler(mon_path, self),
-                                path=mon_path,
-                                recursive=True
-                            )
-                            observer.start()
-                            self._observer.append(observer)
-                            logger.info(f"已启动目录监控: {mon_path}")
-                        else:
-                            logger.warning(f"监控目录不存在，跳过: {mon_path}")
+                    valid_paths = [p for p in self._strm_dir_conf.keys() if Path(p).exists()]
+                    if valid_paths:
+                        self._observer = PollingObserver(timeout=10)
+                        handler = FileMonitorHandler(self)
+                        for mon_path in valid_paths:
+                            self._observer.schedule(handler, path=mon_path, recursive=True)
+                            logger.info(f"已添加目录监控: {mon_path}")
+                        self._observer.start()
+                        logger.info(f"目录监控已启动，共监控 {len(valid_paths)} 个目录")
+                    else:
+                        logger.warning("没有有效的监控目录")
 
                 # 立即运行一次
                 if self._onlyonce:
@@ -749,9 +759,9 @@ class StrmLocal(_PluginBase):
             logger.error(f"停止定时任务失败: {e}")
 
         try:
-            for observer in self._observer:
-                observer.stop()
-                observer.join()
-            logger.info("目录监控已停止")
+            if self._observer:
+                self._observer.stop()
+                self._observer.join()
+                logger.info("目录监控已停止")
         except Exception as e:
             logger.error(f"停止目录监控失败: {e}")
