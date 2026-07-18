@@ -519,15 +519,7 @@ class StrmLocal(_PluginBase):
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "id": "strm_local_event",
-                "name": "本地Strm事件处理",
-                "type": "event",
-                "event_type": EventType.PluginAction,
-                "func": self.strm_one,
-            }
-        ]
+        return []
 
     def get_api(self) -> List[Dict[str, Any]]:
         pass
