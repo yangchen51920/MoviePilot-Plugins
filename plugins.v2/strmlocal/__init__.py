@@ -524,7 +524,7 @@ class StrmLocal(_PluginBase):
                 "id": "strm_local_event",
                 "type": "event",
                 "event_type": EventType.PluginAction,
-                "handler": self.strm_one,
+                "func": self.strm_one,
             }
         ]
 
