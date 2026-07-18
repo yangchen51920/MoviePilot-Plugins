@@ -521,6 +521,7 @@ class StrmLocal(_PluginBase):
     def get_service(self) -> List[Dict[str, Any]]:
         return [
             {
+                "id": "strm_local_event",
                 "type": "event",
                 "event_type": EventType.PluginAction,
                 "handler": self.strm_one,
