@@ -101,6 +101,13 @@ class StrmLocal(_PluginBase):
     _path_replacements = {}
     _scheduler = None
 
+    # 这些视频格式永远不应被复制，只生成strm
+    _VIDEO_EXTS = frozenset({
+        ".mp4", ".mkv", ".ts", ".iso", ".rmvb", ".avi", ".mov", ".mpeg",
+        ".mpg", ".wmv", ".3gp", ".asf", ".m4v", ".flv", ".m2ts", ".strm",
+        ".tp", ".f4v", ".mts", ".vob", ".divx", ".webm", ".ogm", ".wmvhd",
+    })
+
     def init_plugin(self, config: dict = None):
         old_strm_dir_conf = self._strm_dir_conf.copy() if self._strm_dir_conf else {}
 
@@ -305,9 +312,11 @@ class StrmLocal(_PluginBase):
                 if self.__create_strm_file(strm_file=target_file, strm_content=strm_content):
                     result["strm"] = 1
 
-                # 复制同名关联文件（nfo、jpg等）
+                # 复制同名关联文件（nfo、jpg等），排除视频文件
                 pattern = glob.escape(Path(event_path).stem)
                 for file in Path(event_path).parent.glob(f"{pattern}.*"):
+                    if file.suffix.lower() in self._VIDEO_EXTS:
+                        continue
                     if str(file) != str(event_path):
                         target_f = str(file).replace(mon_path, strm_dir)
                         self.__handle_other_files(event_path=str(file), target_file=target_f)
@@ -321,11 +330,7 @@ class StrmLocal(_PluginBase):
                     result["copied"] += 1
             else:
                 # 非媒体文件：跳过视频格式文件，防止配置遗漏导致误复制
-                if Path(event_path).suffix.lower() in [".mp4", ".mkv", ".ts", ".iso", ".rmvb",
-                                                       ".avi", ".mov", ".mpeg", ".mpg", ".wmv",
-                                                       ".3gp", ".asf", ".m4v", ".flv", ".m2ts",
-                                                       ".strm", ".tp", ".f4v", ".mts", ".vob",
-                                                       ".divx", ".webm", ".ogm"]:
+                if Path(event_path).suffix.lower() in self._VIDEO_EXTS:
                     logger.debug(f"跳过视频文件(不在视频格式列表中): {event_path}")
                     return None
                 self.__handle_other_files(event_path=event_path, target_file=target_file)
