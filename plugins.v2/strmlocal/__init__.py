@@ -1,7 +1,9 @@
+import glob
 import os
 import shutil
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, List, Dict, Tuple, Optional
 
@@ -15,8 +17,6 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
 
-lock = threading.Lock()
-
 
 class FileMonitorHandler(FileSystemEventHandler):
     """
@@ -28,8 +28,9 @@ class FileMonitorHandler(FileSystemEventHandler):
         self._sync = sync
 
     def _find_mon_path(self, event_path: str) -> str:
-        """根据事件路径找到匹配的监控源目录"""
-        for mon_path in self._sync._strm_dir_conf.keys():
+        """根据事件路径找到匹配的监控源目录（最长路径优先，避免短路径误匹配）"""
+        sorted_paths = sorted(self._sync._strm_dir_conf.keys(), key=lambda p: len(p), reverse=True)
+        for mon_path in sorted_paths:
             if event_path.startswith(mon_path):
                 return mon_path
         return None
@@ -94,6 +95,8 @@ class StrmLocal(_PluginBase):
     _onlyonce = False
     _strm_dir_conf = {}
     _observer = None
+    _max_workers = 8
+    _polling_interval = 10
     _rmt_mediaext = None
     _path_replacements = {}
     _scheduler = None
@@ -111,6 +114,8 @@ class StrmLocal(_PluginBase):
             self._monitor = config.get("monitor")
             self._cover = config.get("cover")
             self._monitor_confs = config.get("monitor_confs")
+            self._max_workers = int(config.get("max_workers") or 8)
+            self._polling_interval = int(config.get("polling_interval") or 10)
 
             self._rmt_mediaext = config.get(
                 "rmt_mediaext") or ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v"
@@ -173,7 +178,7 @@ class StrmLocal(_PluginBase):
                 if self._monitor:
                     valid_paths = [p for p in self._strm_dir_conf.keys() if Path(p).exists()]
                     if valid_paths:
-                        self._observer = PollingObserver(timeout=10)
+                        self._observer = PollingObserver(timeout=self._polling_interval)
                         handler = FileMonitorHandler(self)
                         for mon_path in valid_paths:
                             self._observer.schedule(handler, path=mon_path, recursive=True)
@@ -191,9 +196,12 @@ class StrmLocal(_PluginBase):
 
     def scan(self):
         """
-        全量扫描生成strm文件
+        全量扫描生成strm文件（多线程并行）
         """
         logger.info("开始全量扫描生成strm文件...")
+        total_files = 0
+        total_strm = 0
+        total_copied = 0
         for mon_path, strm_dir in self._strm_dir_conf.items():
             if not Path(mon_path).exists():
                 logger.warning(f"源目录不存在，跳过: {mon_path}")
@@ -201,18 +209,38 @@ class StrmLocal(_PluginBase):
 
             logger.info(f"全量扫描: {mon_path} -> {strm_dir}")
 
+            # 先收集所有文件路径
+            file_tasks = []
             for root, dirs, files in os.walk(mon_path):
                 for file in files:
-                    file_path = os.path.join(root, file)
-                    try:
-                        self.__handle_file(
-                            event_path=str(file_path),
-                            mon_path=mon_path,
-                        )
-                    except Exception as e:
-                        logger.error(f"处理文件失败 {file_path}: {e}")
+                    file_tasks.append((os.path.join(root, file), mon_path))
 
-        logger.info("全量扫描完成")
+            count = len(file_tasks)
+            total_files += count
+            if not file_tasks:
+                continue
+
+            # 多线程并行处理
+            logger.info(f"发现 {count} 个文件，使用 {self._max_workers} 线程并行处理...")
+            with ThreadPoolExecutor(max_workers=self._max_workers) as executor:
+                futures = {
+                    executor.submit(self.__handle_file, event_path=str(fp), mon_path=mp): fp
+                    for fp, mp in file_tasks
+                }
+                completed = 0
+                for future in as_completed(futures):
+                    completed += 1
+                    if completed % 500 == 0:
+                        logger.info(f"扫描进度: {completed}/{count}")
+                    try:
+                        result = future.result()
+                        if result:
+                            total_strm += result.get("strm", 0)
+                            total_copied += result.get("copied", 0)
+                    except Exception as e:
+                        logger.error(f"处理文件失败 {futures[future]}: {e}")
+
+        logger.info(f"全量扫描完成，共处理 {total_files} 个文件，生成 {total_strm} 个strm，复制 {total_copied} 个关联文件")
 
     def strm_one(self, event: Event = None):
         """
@@ -226,7 +254,8 @@ class StrmLocal(_PluginBase):
             logger.warning("strm_one: 未提供文件路径")
             return
 
-        for mon_path in self._strm_dir_conf.keys():
+        sorted_paths = sorted(self._strm_dir_conf.keys(), key=lambda p: len(p), reverse=True)
+        for mon_path in sorted_paths:
             if str(file_path).startswith(str(mon_path)):
                 self.__handle_file(
                     event_path=str(file_path),
@@ -257,42 +286,54 @@ class StrmLocal(_PluginBase):
     def __handle_file(self, event_path: str, mon_path: str):
         """
         处理单个文件，生成strm或复制关联文件
+        返回 {"strm": count, "copied": count} 或 None
         """
         try:
             if not Path(event_path).exists():
-                return
-            with lock:
-                strm_dir = self._strm_dir_conf.get(mon_path)
-                if not strm_dir:
-                    return
+                return None
+            strm_dir = self._strm_dir_conf.get(mon_path)
+            if not strm_dir:
+                return None
 
-                target_file = str(event_path).replace(mon_path, strm_dir)
+            target_file = str(event_path).replace(mon_path, strm_dir)
+            result = {"strm": 0, "copied": 0}
 
-                if Path(event_path).suffix.lower() in [ext.strip() for ext in
-                                                       self._rmt_mediaext.split(",")]:
-                    # 媒体文件：生成strm
-                    strm_content = str(event_path).replace("\\", "/")
-                    self.__create_strm_file(strm_file=target_file, strm_content=strm_content)
+            if Path(event_path).suffix.lower() in [ext.strip() for ext in
+                                                   self._rmt_mediaext.split(",")]:
+                # 媒体文件：生成strm
+                strm_content = str(event_path).replace("\\", "/")
+                if self.__create_strm_file(strm_file=target_file, strm_content=strm_content):
+                    result["strm"] = 1
 
-                    # 复制同名关联文件（nfo、jpg等）
-                    pattern = Path(event_path).stem.replace('[', '?').replace(']', '?')
-                    files = list(Path(event_path).parent.glob(f"{pattern}.*"))
-                    logger.debug(f"筛选到同名文件 {pattern}: {files}")
-                    for file in files:
-                        if str(file) != str(event_path):
-                            target_f = str(file).replace(mon_path, strm_dir)
-                            self.__handle_other_files(event_path=str(file), target_file=target_f)
+                # 复制同名关联文件（nfo、jpg等）
+                pattern = glob.escape(Path(event_path).stem)
+                for file in Path(event_path).parent.glob(f"{pattern}.*"):
+                    if str(file) != str(event_path):
+                        target_f = str(file).replace(mon_path, strm_dir)
+                        self.__handle_other_files(event_path=str(file), target_file=target_f)
+                        result["copied"] += 1
 
-                    # thumb图片
-                    thumb_file = Path(event_path).parent / (Path(event_path).stem + "-thumb.jpg")
-                    if thumb_file.exists():
-                        target_f = str(thumb_file).replace(mon_path, strm_dir)
-                        self.__handle_other_files(event_path=str(thumb_file), target_file=target_f)
-                else:
-                    # 非媒体文件：直接复制
-                    self.__handle_other_files(event_path=event_path, target_file=target_file)
+                # thumb图片
+                thumb_file = Path(event_path).parent / (Path(event_path).stem + "-thumb.jpg")
+                if thumb_file.exists():
+                    target_f = str(thumb_file).replace(mon_path, strm_dir)
+                    self.__handle_other_files(event_path=str(thumb_file), target_file=target_f)
+                    result["copied"] += 1
+            else:
+                # 非媒体文件：跳过视频格式文件，防止配置遗漏导致误复制
+                if Path(event_path).suffix.lower() in [".mp4", ".mkv", ".ts", ".iso", ".rmvb",
+                                                       ".avi", ".mov", ".mpeg", ".mpg", ".wmv",
+                                                       ".3gp", ".asf", ".m4v", ".flv", ".m2ts",
+                                                       ".strm", ".tp", ".f4v", ".mts", ".vob",
+                                                       ".divx", ".webm", ".ogm"]:
+                    logger.debug(f"跳过视频文件(不在视频格式列表中): {event_path}")
+                    return None
+                self.__handle_other_files(event_path=event_path, target_file=target_file)
+                result["copied"] = 1
+            return result
         except Exception as e:
             logger.error("目录监控发生错误：%s - %s" % (str(e), traceback.format_exc()))
+            return None
 
     def __handle_other_files(self, event_path: str, target_file: str):
         """
@@ -303,7 +344,7 @@ class StrmLocal(_PluginBase):
                 return
             target_dir = Path(target_file).parent
             if not target_dir.exists():
-                os.makedirs(str(target_dir))
+                os.makedirs(str(target_dir), exist_ok=True)
                 logger.info(f"创建目标文件夹 {target_dir}")
 
             target_path = os.path.join(str(target_dir), Path(event_path).name)
@@ -321,31 +362,30 @@ class StrmLocal(_PluginBase):
         删除源文件对应的strm文件，并清理空目录
         """
         try:
-            with lock:
-                target_file = str(event_path).replace(mon_path, strm_dir)
-                strm_file = os.path.join(
-                    Path(target_file).parent,
-                    f"{os.path.splitext(Path(target_file).name)[0]}.strm"
-                )
+            target_file = str(event_path).replace(mon_path, strm_dir)
+            strm_file = os.path.join(
+                Path(target_file).parent,
+                f"{os.path.splitext(Path(target_file).name)[0]}.strm"
+            )
 
-                if Path(strm_file).exists():
-                    os.remove(strm_file)
-                    logger.info(f"已删除strm文件: {strm_file}")
-                else:
-                    logger.debug(f"strm文件不存在，跳过删除: {strm_file}")
+            if Path(strm_file).exists():
+                os.remove(strm_file)
+                logger.info(f"已删除strm文件: {strm_file}")
+            else:
+                logger.debug(f"strm文件不存在，跳过删除: {strm_file}")
 
-                # 删除关联的非媒体文件
-                try:
-                    pattern = Path(event_path).stem.replace('[', '?').replace(']', '?')
-                    for f in Path(target_file).parent.glob(f"{pattern}.*"):
-                        if f.suffix.lower() != ".strm":
-                            os.remove(str(f))
-                            logger.info(f"已删除关联文件: {f}")
-                except Exception as e:
-                    logger.debug(f"清理关联文件失败: {e}")
+            # 删除关联的非媒体文件
+            try:
+                pattern = glob.escape(Path(event_path).stem)
+                for f in Path(target_file).parent.glob(f"{pattern}.*"):
+                    if f.suffix.lower() != ".strm":
+                        os.remove(str(f))
+                        logger.info(f"已删除关联文件: {f}")
+            except Exception as e:
+                logger.debug(f"清理关联文件失败: {e}")
 
-                # 清理空目录
-                self.__cleanup_empty_dirs(Path(strm_file).parent, Path(strm_dir))
+            # 清理空目录
+            self.__cleanup_empty_dirs(Path(strm_file).parent, Path(strm_dir))
         except Exception as e:
             logger.error(f"删除strm文件失败 {event_path}: {e}")
 
@@ -450,7 +490,7 @@ class StrmLocal(_PluginBase):
         try:
             if not Path(strm_file).parent.exists():
                 logger.info(f"创建目标文件夹 {Path(strm_file).parent}")
-                os.makedirs(Path(strm_file).parent)
+                os.makedirs(Path(strm_file).parent, exist_ok=True)
 
             strm_file = os.path.join(
                 Path(strm_file).parent,
@@ -487,6 +527,8 @@ class StrmLocal(_PluginBase):
             "onlyonce": self._onlyonce,
             "monitor_confs": self._monitor_confs,
             "rmt_mediaext": self._rmt_mediaext,
+            "max_workers": self._max_workers,
+            "polling_interval": self._polling_interval,
             "path_replacements": "\n".join(
                 [f"{k}:{v}" for k, v in self._path_replacements.items()]
             ),
@@ -629,6 +671,48 @@ class StrmLocal(_PluginBase):
                             }
                         ]
                     },
+                    # ========== 性能配置 ==========
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'max_workers',
+                                            'label': '扫描线程数',
+                                            'placeholder': '8',
+                                            'type': 'number',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 6
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'polling_interval',
+                                            'label': '轮询间隔（秒）',
+                                            'placeholder': '10',
+                                            'type': 'number',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
                     # ========== 目录配置 ==========
                     {
                         'component': 'VRow',
@@ -734,6 +818,8 @@ class StrmLocal(_PluginBase):
             "cover": False,
             "onlyonce": False,
             "monitor_confs": "",
+            "max_workers": 8,
+            "polling_interval": 10,
             "rmt_mediaext": ".mp4, .mkv, .ts, .iso,.rmvb, .avi, .mov, .mpeg,.mpg, .wmv, .3gp, .asf, .m4v, .flv, .m2ts, .strm,.tp, .f4v",
             "path_replacements": "",
         }
