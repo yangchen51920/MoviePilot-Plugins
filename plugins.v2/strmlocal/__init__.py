@@ -312,15 +312,12 @@ class StrmLocal(_PluginBase):
                 if self.__create_strm_file(strm_file=target_file, strm_content=strm_content):
                     result["strm"] = 1
 
-                # 复制同名关联文件（nfo、jpg等），排除视频文件
+                # 复制同名关联文件（nfo、jpg等）
                 pattern = glob.escape(Path(event_path).stem)
                 for file in Path(event_path).parent.glob(f"{pattern}.*"):
-                    if file.suffix.lower() in self._VIDEO_EXTS:
-                        continue
-                    if str(file) != str(event_path):
-                        target_f = str(file).replace(mon_path, strm_dir)
-                        self.__handle_other_files(event_path=str(file), target_file=target_f)
-                        result["copied"] += 1
+                    target_f = str(file).replace(mon_path, strm_dir)
+                    self.__handle_other_files(event_path=str(file), target_file=target_f)
+                    result["copied"] += 1
 
                 # thumb图片
                 thumb_file = Path(event_path).parent / (Path(event_path).stem + "-thumb.jpg")
@@ -329,10 +326,7 @@ class StrmLocal(_PluginBase):
                     self.__handle_other_files(event_path=str(thumb_file), target_file=target_f)
                     result["copied"] += 1
             else:
-                # 非媒体文件：跳过视频格式文件，防止配置遗漏导致误复制
-                if Path(event_path).suffix.lower() in self._VIDEO_EXTS:
-                    logger.debug(f"跳过视频文件(不在视频格式列表中): {event_path}")
-                    return None
+                # 非媒体文件：直接复制（__handle_other_files内部已做视频过滤）
                 self.__handle_other_files(event_path=event_path, target_file=target_file)
                 result["copied"] = 1
             return result
@@ -343,8 +337,13 @@ class StrmLocal(_PluginBase):
     def __handle_other_files(self, event_path: str, target_file: str):
         """
         处理非媒体文件（复制nfo、jpg等）
+        视频文件一律不复制，只打日志
         """
         try:
+            # 入口拦截：视频文件绝不复制
+            if Path(event_path).suffix.lower() in self._VIDEO_EXTS:
+                logger.debug(f"跳过视频文件复制: {event_path}")
+                return
             if not Path(event_path).exists():
                 return
             target_dir = Path(target_file).parent
