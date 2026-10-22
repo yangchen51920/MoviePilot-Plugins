@@ -50,7 +50,7 @@ class StrmGenerate(_PluginBase):
     plugin_name = "STRM生成"
     plugin_desc = "将本地媒体目录镜像为STRM库：视频生成.strm，字幕/海报/nfo等侧边文件原样复制，支持一次性生成与定时监控同步。"
     plugin_icon = "strm.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.4"
     plugin_author = "bao"
     author_url = ""
     plugin_config_prefix = "strmgenerate_"
@@ -106,8 +106,7 @@ class StrmGenerate(_PluginBase):
             self._scheduler = BackgroundScheduler(timezone=settings.TZ)
 
             if need_run_once:
-                logger.info("STRM生成：安排立即生成一次（模式：%s）",
-                            "覆盖生成" if self._mode == MODE_OVERWRITE else "查漏补缺")
+                logger.info("STRM生成：安排立即运行一次（模式：%s）", self.__mode_label(self._mode))
                 self._scheduler.add_job(
                     func=self.__run_once,
                     trigger="date",
@@ -230,9 +229,8 @@ class StrmGenerate(_PluginBase):
 
     # ====================== 入口 ======================
     def __run_once(self) -> None:
-        """一次性生成，使用配置里的模式（查漏补缺 / 覆盖生成）。"""
-        logger.info("STRM生成：开始一次性生成（模式：%s）",
-                    "覆盖生成" if self._mode == MODE_OVERWRITE else "查漏补缺")
+        """一次性生成，使用配置里的运行模式（查漏补缺 / 覆盖生成 / 监控同步）。"""
+        logger.info("STRM生成：开始一次性运行（模式：%s）", self.__mode_label(self._mode))
         self.__process_all(self._mode)
 
     def __run_sync(self) -> None:
@@ -311,7 +309,7 @@ class StrmGenerate(_PluginBase):
             # 源目录整体被删除：监控模式下清空对应的生成目录（孤儿全部删除）
             if mode == MODE_SYNC:
                 logger.warning("STRM生成：源目录不存在，清理对应生成目录 %s", src_root)
-                self.__cleanup_orphans(dst_root, expected, stat)
+                self.__cleanup_orphans(src_root, dst_root, expected, stat)
             else:
                 logger.warning("STRM生成：源目录不存在 %s", src_root)
                 stat["error"] = 1
@@ -341,9 +339,9 @@ class StrmGenerate(_PluginBase):
                     logger.error("STRM生成：处理文件失败 %s：%s", src_file, e)
                     stat["error"] += 1
 
-        # 2) 监控模式下清理孤儿文件与空目录
+        # 2) 监控模式下清理孤儿文件与空目录（保守删除）
         if mode == MODE_SYNC:
-            self.__cleanup_orphans(dst_root, expected, stat)
+            self.__cleanup_orphans(src_root, dst_root, expected, stat)
 
         return stat
 
@@ -407,45 +405,120 @@ class StrmGenerate(_PluginBase):
             path = path.replace(find, replace)
         return path
 
-    def __cleanup_orphans(self, dst_root: Path, expected: set, stat: dict) -> None:
-        """删除目标目录中不再有对应源文件的 strm / 侧边文件，并清理空目录。"""
+    def __cleanup_orphans(self, src_root: Path, dst_root: Path, expected: set, stat: dict) -> None:
+        """清理孤儿文件并删除空目录（保守：只删本插件生成、且源已删除的文件）。
+
+        - .strm：内容指向 src_root 之内、且对应源文件已不存在 -> 删除；
+          内容指向 src_root 之外（非本插件生成）或源文件仍在 -> 保留。
+        - 侧边文件：仅当所在目录的 strm 全部成为孤儿时 -> 一并删除。
+        """
         if not dst_root.is_dir():
             return
-        orphans: List[Path] = []
+
+        orphan_strm_dirs: set = set()   # 有孤儿 strm 被删除的目录
+        kept_strm_dirs: set = set()     # 有 strm 被保留的目录
+
+        # 第一遍：处理 .strm
         for dirpath, _dirnames, filenames in os.walk(dst_root):
             for fn in filenames:
+                if self._event.is_set():
+                    return
                 target_file = Path(dirpath) / fn
+                if target_file.suffix.lower().lstrip(".") != "strm":
+                    continue
+                try:
+                    rel = target_file.relative_to(dst_root).as_posix()
+                except ValueError:
+                    continue
+                if rel in expected:
+                    kept_strm_dirs.add(dirpath)
+                    continue
+                if self.__is_orphan_strm(src_root, target_file):
+                    try:
+                        target_file.unlink()
+                        stat["delete"] += 1
+                        orphan_strm_dirs.add(dirpath)
+                        logger.info("STRM生成：删除孤儿 strm %s", target_file)
+                    except OSError as e:
+                        logger.warning("STRM生成：删除失败 %s：%s", target_file, e)
+                        stat["error"] += 1
+                else:
+                    kept_strm_dirs.add(dirpath)
+
+        # 第二遍：处理侧边文件
+        for dirpath, _dirnames, filenames in os.walk(dst_root):
+            for fn in filenames:
+                if self._event.is_set():
+                    return
+                target_file = Path(dirpath) / fn
+                if target_file.suffix.lower().lstrip(".") not in self._copy_ext_set:
+                    continue
                 try:
                     rel = target_file.relative_to(dst_root).as_posix()
                 except ValueError:
                     continue
                 if rel in expected:
                     continue
-                ext = target_file.suffix.lower().lstrip(".")
-                if ext == "strm" or ext in self._copy_ext_set:
-                    orphans.append(target_file)
+                # 仅当该目录的 strm 全部为孤儿时才删除侧边文件
+                if dirpath in orphan_strm_dirs and dirpath not in kept_strm_dirs:
+                    try:
+                        target_file.unlink()
+                        stat["delete"] += 1
+                        logger.info("STRM生成：删除孤儿侧边文件 %s", target_file)
+                    except OSError as e:
+                        logger.warning("STRM生成：删除失败 %s：%s", target_file, e)
+                        stat["error"] += 1
 
-        if orphans:
-            logger.info("STRM生成：发现 %s 个孤儿文件待删除（目录：%s）", len(orphans), dst_root)
+        # 第三遍：自底向上回收「本次清理中被掏空」的目录及其空父目录。
+        # 只删除因上面删除了孤儿 strm / 侧边文件而变空的目录，绝不触碰
+        # 目标目录里其它（哪怕原本就是空的）文件夹。
+        dst_root_s = os.path.normpath(str(dst_root))
+        for d in sorted(orphan_strm_dirs, key=lambda x: x.count(os.sep), reverse=True):
+            cur = os.path.normpath(d)
+            while True:
+                if cur == dst_root_s:
+                    break
+                # 安全兜底：仅处理 dst_root 之下的目录
+                if not cur.startswith(dst_root_s + os.sep):
+                    break
+                try:
+                    os.rmdir(cur)
+                except OSError:
+                    # 目录非空（含其它内容）→ 其父目录也不会因此变空，停止向上
+                    break
+                cur = os.path.dirname(cur)
 
-        for f in orphans:
-            if self._event.is_set():
-                return
-            try:
-                f.unlink()
-                stat["delete"] += 1
-            except OSError as e:
-                logger.warning("STRM生成：删除失败 %s：%s", f, e)
-                stat["error"] += 1
+    def __is_orphan_strm(self, src_root: Path, target_file: Path) -> bool:
+        """判断 .strm 是否为孤儿：内容指向 src_root 之内、且对应源文件已不存在。"""
+        try:
+            content = target_file.read_text(encoding="utf-8").strip()
+        except Exception:
+            return False
+        if not content:
+            return False
+        src_path = self.__recover_source_path(content)
+        if not src_path:
+            return False
+        if not self.__is_under(src_root, src_path):
+            return False
+        return not Path(src_path).exists()
 
-        # 自底向上删除空目录（os.rmdir 仅删除空目录）
-        for dirpath, _dirnames, _filenames in os.walk(dst_root, topdown=False):
-            if dirpath == str(dst_root):
-                continue
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
+    def __recover_source_path(self, content: str) -> Optional[str]:
+        """把 strm 内容（可能已按规则替换）还原为真实源路径。"""
+        path = content
+        for find, replace in reversed(self._replace_rules):
+            path = path.replace(replace, find)
+        return path
+
+    @staticmethod
+    def __is_under(src_root: Path, path: str) -> bool:
+        """判断路径是否位于 src_root 之下（含相等）。"""
+        try:
+            s = os.path.normpath(str(src_root)).replace("\\", "/").rstrip("/")
+            p = os.path.normpath(path).replace("\\", "/").rstrip("/")
+        except Exception:
+            return False
+        return p == s or p.startswith(s + "/")
 
     # ====================== 页面 ======================
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -490,10 +563,11 @@ class StrmGenerate(_PluginBase):
                                         "component": "VSelect",
                                         "props": {
                                             "model": "mode",
-                                            "label": "一次性生成模式",
+                                            "label": "运行模式（影响「立即生成一次」）",
                                             "items": [
                                                 {"title": "查漏补缺（只生成缺失的）", "value": "missing"},
                                                 {"title": "覆盖生成（重新生成所有）", "value": "overwrite"},
+                                                {"title": "监控同步（补缺失+删除孤儿）", "value": "sync"},
                                             ],
                                         },
                                     },
@@ -599,7 +673,7 @@ class StrmGenerate(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "STRM文件内容为源视频绝对路径；填写路径替换规则后按「查找#替换」逐条替换。监控需与「启用插件」同时打开才生效；监控会：新增自动生成、源删除自动清理对应strm/文件及空目录。",
+                                            "text": "STRM文件内容为源视频绝对路径；填写路径替换规则后按「查找#替换」逐条替换。监控需与「启用插件」同时打开才生效；监控会：新增自动生成、源删除自动清理对应strm/文件。删除仅针对本插件从源生成、且源已删除的文件，随后只回收因此变空的目录；目标目录里源之外（非本插件生成）的文件或文件夹——包括原本就为空的文件夹——一律不动。把运行模式选为「监控同步」再点「立即生成一次」，可立即清理孤儿文件（无需等定时扫描）。",
                                         },
                                     },
                                 ],
@@ -622,11 +696,23 @@ class StrmGenerate(_PluginBase):
 
     def get_page(self) -> List[dict]:
         status = self.get_data("status") or {}
+        monitor_on = bool(self._enabled and self._monitor)
+        monitor_line = (
+            f"监控状态：已开启（每 {self._monitor_interval} 分钟扫描一次）"
+            if monitor_on
+            else "监控状态：未开启（需「启用插件」+「开启监控」同时打开）"
+        )
         if not status:
-            text = "尚未运行过。配置好目录后点击「立即生成一次」，或同时开启「启用插件」与「开启监控」。"
+            text = (
+                f"{monitor_line}\n"
+                "尚未运行过。可点「立即生成一次」先全量生成；"
+                "要清理已删除源对应的孤儿文件，可开启监控等待扫描，"
+                "或把运行模式选为「监控同步」后点「立即生成一次」。"
+            )
         else:
             total = status.get("total") or {}
             text = (
+                f"{monitor_line}\n"
                 f"上次运行：{status.get('time', '-')}（模式：{self.__mode_label(status.get('mode'))}）\n"
                 f"生成strm {total.get('strm', 0)}，复制 {total.get('copy', 0)}，"
                 f"删除 {total.get('delete', 0)}，跳过 {total.get('skip', 0)}，错误 {total.get('error', 0)}"
