@@ -1,0 +1,15 @@
+{
+  "StrmGenerate": {
+    "name": "STRM生成",
+    "description": "将本地媒体目录镜像为STRM库：视频生成.strm，字幕/海报/nfo等侧边文件原样复制，支持一次性生成与定时监控同步。",
+    "labels": "媒体库",
+    "version": "1.0.0",
+    "icon": "strm.png",
+    "author": "bao",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首次发布。"
+    }
+  }
+}
